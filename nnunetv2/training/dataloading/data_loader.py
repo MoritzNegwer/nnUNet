@@ -1,17 +1,11 @@
 import os
-import sys
 import warnings
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Union, Tuple, List
 
 import numpy as np
 import torch
 from batchgenerators.dataloading.data_loader import DataLoader
 from batchgenerators.utilities.file_and_folder_operations import join, load_json
-try:
-    from threadpoolctl import ThreadpoolController
-except ImportError:  # threadpoolctl < 3.0
-    ThreadpoolController = None
 from threadpoolctl import threadpool_limits
 
 from nnunetv2.paths import nnUNet_preprocessed
@@ -20,69 +14,6 @@ from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
-
-
-def _writeable(arr: np.ndarray) -> np.ndarray:
-    """
-    The data augmentation writes into the patches in place. A crop that lies inside a case is a view of the case,
-    and for unpacked .npy data that is a read-only memory-mapped file: writing into it crashes the dataloader worker.
-    Only those crops are copied. blosc2 crops and padded crops are new arrays already.
-    """
-    return arr if arr.flags.writeable else arr.copy()
-
-
-# threadpool_limits() builds a new controller on every call, and that scans all shared libraries loaded in the process
-# (~7 ms per call with torch loaded). The dataloader enters the limit once per batch, so it keeps one controller per
-# process instead and only builds a new one when modules were imported since, which may have loaded new thread pools.
-# Module globals rather than DataLoader attributes, so that the dataloader stays picklable for its worker processes.
-_threadpool_controller = None
-_threadpool_controller_nmodules = -1
-
-
-def _single_threaded_math_libraries():
-    """Same as threadpool_limits(limits=1, user_api=None), without rescanning the loaded libraries each time"""
-    global _threadpool_controller, _threadpool_controller_nmodules
-    if ThreadpoolController is None:
-        return threadpool_limits(limits=1, user_api=None)
-    if _threadpool_controller is None or len(sys.modules) != _threadpool_controller_nmodules:
-        _threadpool_controller = ThreadpoolController()
-        _threadpool_controller_nmodules = len(sys.modules)
-    return _threadpool_controller.limit(limits=1, user_api=None)
-
-
-# The segmentation crop of a sample runs in a second thread while the data crop runs in the dataloader's own thread.
-# blosc2 (python-blosc2 releases with GIL-free slice reads) and numpy (copies of memory-mapped .npy files) both release
-# the GIL while they read, so the two reads overlap; on network file systems that hides most of the segmentation's
-# read time. With a blosc2 that holds the GIL the reads simply take turns, as before. One thread per process, kept in
-# module globals so that the dataloader stays picklable; a forked worker makes its own.
-_seg_crop_executor = None
-_seg_crop_executor_pid = None
-
-
-def _seg_crop_executor_for_this_process() -> ThreadPoolExecutor:
-    global _seg_crop_executor, _seg_crop_executor_pid
-    if _seg_crop_executor is None or _seg_crop_executor_pid != os.getpid():
-        _seg_crop_executor = ThreadPoolExecutor(1, thread_name_prefix='nnUNet_seg_crop')
-        _seg_crop_executor_pid = os.getpid()
-    return _seg_crop_executor
-
-
-def _crop_segs(seg, seg_prev, bbox):
-    """Crops (int16 numpy arrays) of the segmentation and of the previous stage's segmentation (or None)"""
-    seg_cropped = _writeable(crop_and_pad_nd(seg, bbox, -1, cast_cropped_to=np.int16))
-    if seg_prev is None:
-        return seg_cropped, None
-    return seg_cropped, _writeable(crop_and_pad_nd(seg_prev, bbox, -1, cast_cropped_to=np.int16))
-
-
-def _crop_segs_async(seg, seg_prev, bbox) -> Future:
-    """_crop_segs in the seg crop thread. Inputs that are torch tensors are cropped right here instead: torch's
-    OpenMP thread limit is per thread, so the limit the dataloader sets would not hold in the seg crop thread."""
-    if isinstance(seg, torch.Tensor) or isinstance(seg_prev, torch.Tensor):
-        done = Future()
-        done.set_result(_crop_segs(seg, seg_prev, bbox))
-        return done
-    return _seg_crop_executor_for_this_process().submit(_crop_segs, seg, seg_prev, bbox)
 
 
 class nnUNetDataLoader(DataLoader):
@@ -210,9 +141,8 @@ class nnUNetDataLoader(DataLoader):
             if selected_class is not None:
                 selected_voxel = fg_locations.sample(identifier, selected_class)
                 # selected voxel is center voxel. Subtract half the patch size to get lower bbox voxel.
-                # Make sure it is within the bounds of lb and ub, so that foreground patches stay inside the case
-                # just like random ones. The voxel is still in the final patch after clamping
-                bbox_lbs = [max(lbs[i], min(ubs[i], selected_voxel[i] - self.patch_size[i] // 2)) for i in range(dim)]
+                # Make sure it is within the bounds of lb and ub
+                bbox_lbs = [max(lbs[i], selected_voxel[i] - self.patch_size[i] // 2) for i in range(dim)]
             else:
                 # If the image does not contain any foreground classes, we fall back to random cropping
                 bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) for i in range(dim)]
@@ -228,7 +158,7 @@ class nnUNetDataLoader(DataLoader):
         seg_all = None
 
         with torch.no_grad():
-            with _single_threaded_math_libraries():
+            with threadpool_limits(limits=1, user_api=None):
                 for j, i in enumerate(selected_keys):
                     # oversampling foreground will improve stability of model training, especially if many patches are empty
                     # (Lung for example)
@@ -243,13 +173,10 @@ class nnUNetDataLoader(DataLoader):
                     bbox_lbs, bbox_ubs = self.get_bbox(i, shape, force_fg)
                     bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
 
-                    # the segmentation(s) are read in the seg crop thread meanwhile (see _crop_segs_async)
-                    segs_cropped = _crop_segs_async(seg, seg_prev, bbox)
-                    data_cropped = torch.from_numpy(_writeable(crop_and_pad_nd(data, bbox, 0))).float()
-                    seg_cropped, seg_prev_cropped = segs_cropped.result()
-                    seg_cropped = torch.from_numpy(seg_cropped).to(torch.int16)
-                    if seg_prev_cropped is not None:
-                        seg_prev_cropped = torch.from_numpy(seg_prev_cropped).to(torch.int16)
+                    data_cropped = torch.from_numpy(crop_and_pad_nd(data, bbox, 0)).float()
+                    seg_cropped = torch.from_numpy(crop_and_pad_nd(seg, bbox, -1, cast_cropped_to=np.int16)).to(torch.int16)
+                    if seg_prev is not None:
+                        seg_prev_cropped = torch.from_numpy(crop_and_pad_nd(seg_prev, bbox, -1, cast_cropped_to=np.int16)).to(torch.int16)
                         seg_cropped = torch.cat((seg_cropped, seg_prev_cropped[None]), dim=0)
 
                     if self.patch_size_was_2d:

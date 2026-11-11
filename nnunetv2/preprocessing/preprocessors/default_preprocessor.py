@@ -75,14 +75,19 @@ class DefaultPreprocessor(object):
             # target spacing for 2d has 2 entries but the data and original_spacing have three because everything is 3d
             # in 2d configuration we do not change the spacing between slices
             target_spacing = [original_spacing[0]] + target_spacing
-        target_spacing = [o if t is None else t for t, o in zip(target_spacing, original_spacing)]
         new_shape = compute_new_shape(data.shape[1:], original_spacing, target_spacing)
 
         # normalize
         # normalization MUST happen before resampling or we get huge problems with resampled nonzero masks no
         # longer fitting the images perfectly!
-        data = self._normalize(data, seg, configuration_manager,
-                               plans_manager.foreground_intensity_properties_per_channel)
+
+        if properties["global_min"] is not None:
+            #then use the global_95 normalization 
+            data = self._normalize(data, seg, configuration_manager,
+                                   plans_manager.foreground_intensity_properties_per_channel,properties["global_min"], properties["global_max"])
+        else:        
+            data = self._normalize(data, seg, configuration_manager,
+                                   plans_manager.foreground_intensity_properties_per_channel)
 
         # print('current shape', data.shape[1:], 'current_spacing', original_spacing,
         #       '\ntarget shape', new_shape, 'target_spacing', target_spacing)
@@ -341,7 +346,7 @@ class DefaultPreprocessor(object):
     #     return class_locs
 
     def _normalize(self, data: np.ndarray, seg: np.ndarray, configuration_manager: ConfigurationManager,
-                   foreground_intensity_properties_per_channel: dict) -> np.ndarray:
+                   foreground_intensity_properties_per_channel: dict, global_min: Optional[int] = None, global_max: Optional[int] = None) -> np.ndarray:
         for c in range(data.shape[0]):
             scheme = configuration_manager.normalization_schemes[c]
             normalizer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "preprocessing", "normalization"),
@@ -349,8 +354,9 @@ class DefaultPreprocessor(object):
                                                            'nnunetv2.preprocessing.normalization')
             if normalizer_class is None:
                 raise RuntimeError(f'Unable to locate class \'{scheme}\' for normalization')
+
             normalizer = normalizer_class(use_mask_for_norm=configuration_manager.use_mask_for_norm[c],
-                                          intensityproperties=foreground_intensity_properties_per_channel[str(c)])
+                                          intensityproperties=foreground_intensity_properties_per_channel[str(c)], global_min=global_min, global_max=global_max)
             data[c] = normalizer.run(data[c], seg[0])
         return data
 

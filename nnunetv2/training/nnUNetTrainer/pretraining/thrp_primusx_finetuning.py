@@ -16,7 +16,6 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.helpers import empty_cache, dummy_context, set_default_inductor_cache_dir
 from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
-from nnunetv2.utilities.plans_handling.plans_handler import ConfigurationManager, PlansManager
 from nnunetv2.training.nnUNetTrainer.pretraining.pretrainedTrainer import PretrainedTrainer_Primus
 import warnings
 
@@ -71,10 +70,12 @@ class PretrainedTrainer_Primusx(PretrainedTrainer_Primus):
             #   This plan holds details on how the architecture is supposed to be built.
 
             self.network = self.build_network_architecture(
-                self.plans_manager,
-                self.configuration_manager,
-                self.num_input_channels,
-                self.label_manager.num_segmentation_heads,
+                architecture_class_name=self.configuration_manager.network_arch_class_name,
+                arch_init_kwargs=self.configuration_manager.network_arch_init_kwargs,
+                arch_init_kwargs_req_import=self.configuration_manager.network_arch_init_kwargs_req_import,
+                input_patch_size=self.configuration_manager.patch_size,  # Set in plan to pt_recommended_patchsize
+                num_input_channels=self.num_input_channels,
+                num_output_channels=self.label_manager.num_segmentation_heads,
                 enable_deep_supervision=False,
             ).to(self.device)
 
@@ -130,16 +131,14 @@ class PretrainedTrainer_Primusx(PretrainedTrainer_Primus):
             )
     @staticmethod
     def build_network_architecture(
-        plans_manager: PlansManager,
-        configuration_manager: ConfigurationManager,
+        architecture_class_name: str,
+        arch_init_kwargs: dict,
+        arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
         num_input_channels: int,
         num_output_channels: int,
         enable_deep_supervision: bool = True,
+        input_patch_size: tuple[int, int, int] = None,
         ) -> nn.Module:
-        architecture_class_name = configuration_manager.network_arch_class_name
-        arch_init_kwargs = configuration_manager.network_arch_init_kwargs
-        # nnUNetv2_preprocess_like_nnssl sets the plan's patch size to the pretraining's recommendation
-        input_patch_size = configuration_manager.patch_size
         # this architecture will crash if the patch size is not divisible by 8!
         # Named architectures (e.g. PrimusM/S/L/B, ResEncL) come with arch_init_kwargs == None in the plan;
         # their configuration lives inside get_network_from_name. Only the explicit-kwargs "PrimusX" flavour

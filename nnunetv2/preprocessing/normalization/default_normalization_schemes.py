@@ -9,12 +9,15 @@ class ImageNormalization(ABC):
     leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = None
 
     def __init__(self, use_mask_for_norm: bool = None, intensityproperties: dict = None,
-                 target_dtype: Type[number] = np.float32):
+                 target_dtype: Type[number] = np.float32, 
+                 global_min: Optional[int] = None, global_max: Optional[int] = None):
         assert use_mask_for_norm is None or isinstance(use_mask_for_norm, bool)
         self.use_mask_for_norm = use_mask_for_norm
         assert isinstance(intensityproperties, dict)
         self.intensityproperties = intensityproperties
         self.target_dtype = target_dtype
+        self.global_min = global_min
+        self.global_max = global_max
 
     @abstractmethod
     def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
@@ -102,3 +105,29 @@ class RGBTo01Normalization(ImageNormalization):
         image = image.astype(self.target_dtype, copy=False)
         image /= 255.
         return image
+
+class Global95PercentileNormalization(ImageNormalization):
+    leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = True
+
+    def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
+        assert self.intensityproperties is not None, "Global95PercentileNormalization requires intensity properties"
+        eps = 1e-8 if not self.target_dtype == np.float16 else 1e-4
+        
+        #get properties
+        lower_bound = self.global_min
+        upper_bound = self.global_max
+        
+        #debug
+        #print(f"lower_bound: {lower_bound}. upper_bound: {upper_bound}")
+
+        #get image
+        image = image.astype(self.target_dtype, copy=False)
+        
+        #clip image
+        np.clip(image, lower_bound, upper_bound, out=image)
+        
+        #normalize image 
+        image = (image - lower_bound) / upper_bound
+        return image
+
+

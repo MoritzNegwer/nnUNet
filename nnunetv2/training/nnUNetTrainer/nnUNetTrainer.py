@@ -280,17 +280,13 @@ class nnUNetTrainer(object):
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
                 # static_graph=True would let DDP optimize its gradient buckets from the first iteration and would
                 # also make genuinely unused parameters legal, but it hard-errors on any trainer that changes the
-                # graph between iterations (freezing/unfreezing layers, conditional branches). We do not need it.
-                # With deep supervision, the weight hack in _build_loss keeps every parameter in the graph. Without
-                # it, the decoder still has a segmentation layer for every resolution (so that checkpoints load either
-                # way) but only uses the last one, so DDP has to look for unused parameters. That costs <0.3 % of
-                # iteration time; keeping it off with deep supervision keeps DDP's check for unexpectedly unused
-                # parameters.
+                # graph between iterations (freezing/unfreezing layers, conditional branches). We do not need it:
+                # the deep supervision weight hack in _build_loss already keeps every parameter in the graph.
                 self.network = DDP(
                     self.network,
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
-                    find_unused_parameters=not self.enable_deep_supervision)
+                    find_unused_parameters=False)
 
             self.loss = self._build_loss()
 
@@ -999,6 +995,10 @@ class nnUNetTrainer(object):
         if not self.was_initialized:
             self.initialize()
 
+        # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
+        # which may not be present  when doing inference
+        self.dataloader_train, self.dataloader_val = self.get_dataloaders()
+
         maybe_mkdir_p(self.output_folder)
 
         # make sure deep supervision is on in the network
@@ -1017,12 +1017,6 @@ class nnUNetTrainer(object):
 
         if self.is_ddp:
             dist.barrier()
-
-        # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
-        # which may not be present  when doing inference. Their workers start reading right away, so this has to come
-        # after the unpacking, and in DDP after the barrier: only rank 0 unpacks, and a worker that opens a .npy file
-        # while it is being written fails with "mmap length is greater than file size"
-        self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
         # copy plans and dataset.json so that they can be used for restoring everything we need for inference
         save_json(self.plans_manager.plans, join(self.output_folder_base, 'plans.json'), sort_keys=False)

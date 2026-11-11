@@ -53,6 +53,8 @@ class Tiff3DIO(BaseReaderWriter):
         expected_aux_file = image_fnames[0][:-truncate_length] + '.json'
         if isfile(expected_aux_file):
             spacing = load_json(expected_aux_file)['spacing']
+            global_min = load_json(expected_aux_file)['global_min']
+            global_max = load_json(expected_aux_file)['global_max']
             assert len(spacing) == 3, f'spacing must have 3 entries, one for each dimension of the image. File: {expected_aux_file}'
         else:
             print(f'WARNING no spacing file found for images {image_fnames}\nAssuming spacing (1, 1, 1).')
@@ -66,7 +68,7 @@ class Tiff3DIO(BaseReaderWriter):
             print(image_fnames)
             raise RuntimeError()
 
-        return np.vstack(images, dtype=np.float32, casting='unsafe'), {'spacing': spacing}
+        return np.vstack(images, dtype=np.float32, casting='unsafe'), {'spacing': spacing, 'global_min': global_min, 'global_max': global_max}
 
     def write_seg(self, seg: np.ndarray, output_fname: str, properties: dict) -> None:
         # not ideal but I really have no clue how to set spacing/resolution information properly in tif files haha

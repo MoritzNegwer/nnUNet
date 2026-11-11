@@ -2,13 +2,13 @@ from torch import nn
 
 
 class DeepSupervisionWrapper(nn.Module):
-    def __init__(self, loss, weight_factors):
+    def __init__(self, loss, weight_factors=None):
         """
         Wraps a loss function so that it can be applied to multiple outputs. Forward accepts an arbitrary number of
-        inputs. Each input is expected to be a tuple/list. The loss is then applied to each entry like this:
+        inputs. Each input is expected to be a tuple/list. Each tuple/list must have the same length. The loss is then
+        applied to each entry like this:
         l = w0 * loss(input0[0], input1[0], ...) +  w1 * loss(input0[1], input1[1], ...) + ...
-        Like zip, this stops at the shortest input, so a network may return more outputs than there are targets.
-        weight_factors needs a weight for each term; terms with weight 0 are skipped.
+        If weights are None, all w will be 1.
         """
         super(DeepSupervisionWrapper, self).__init__()
         assert any([x != 0 for x in weight_factors]), "At least one weight factor should be != 0.0"
@@ -21,5 +21,9 @@ class DeepSupervisionWrapper(nn.Module):
         # we could check for equal lengths here as well, but we really shouldn't overdo it with checks because
         # this code is executed a lot of times!
 
-        weights = self.weight_factors
+        if self.weight_factors is None:
+            weights = (1, ) * len(args[0])
+        else:
+            weights = self.weight_factors
+
         return sum([weights[i] * self.loss(*inputs) for i, inputs in enumerate(zip(*args)) if weights[i] != 0.0])
